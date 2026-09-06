@@ -8,17 +8,24 @@ and emits numbers in its rationale text, those numbers are never
 parsed into anything the rest of the pipeline uses — TechnicalSignal
 + RiskManager alone determine entry/stop/target/size/leverage.
 
-If ANTHROPIC_API_KEY is not configured, this falls back to a
-transparent rule-based assessment derived purely from the technical
+This agent tries a prioritized chain of LLM providers (see
+core/ai_providers.py and config.AI_PROVIDER_PRIORITY) and uses the
+first one that returns a valid, parseable response. If a provider
+errors out, is rate-limited, or returns garbage, the next one in the
+chain is tried automatically — that's how "use all the free models"
+works in practice: as a fallback chain, not a simultaneous ensemble.
+
+If no provider is configured (or every one fails), this falls back to
+a transparent rule-based assessment derived purely from the technical
 score, so the system remains fully functional (offline mode) while
 clearly labeling that fallback in AIAssessment.source.
 """
 from __future__ import annotations
 
 import json
+from typing import List
 
-import requests
-
+from core.ai_providers import ProviderConfig, call_provider
 from core.models import AIAssessment, Direction, NewsAssessment, TechnicalSignal
 
 SYSTEM_PROMPT = """You are a market-analysis assistant inside an automated pipeline.
@@ -36,15 +43,25 @@ STRICT RULES:
 """
 
 
+def _strip_json_fences(text: str) -> str:
+    t = text.strip()
+    if t.startswith("```"):
+        t = t.strip("`")
+        if t.lower().startswith("json"):
+            t = t[4:]
+    return t.strip()
+
+
 class AIAgent:
-    def __init__(self, api_key: str, model: str, timeout: int = 30):
-        self.api_key = api_key
-        self.model = model
+    def __init__(self, providers: List[ProviderConfig], timeout: int = 30):
+        # Only keep providers that actually have what they need to be called
+        # (an API key, or a free anonymous tier that needs none).
+        self.providers = [p for p in providers if p.is_usable]
         self.timeout = timeout
 
     @property
     def is_online(self) -> bool:
-        return bool(self.api_key)
+        return bool(self.providers)
 
     def _rule_based_fallback(self, technical: TechnicalSignal, news: NewsAssessment) -> AIAssessment:
         direction = technical.bias
@@ -57,7 +74,7 @@ class AIAgent:
             conviction *= 0.7
 
         rationale = (
-            f"Rule-based fallback (no AI key configured): technical score {technical.score:.0f}, "
+            f"Rule-based fallback (no AI provider available): technical score {technical.score:.0f}, "
             f"bias {direction.value}, news sentiment {news.sentiment_score:+.2f}."
         )
         return AIAssessment(
@@ -92,40 +109,29 @@ class AIAgent:
                 "recent_headlines": news.headlines,
             },
         }
+        user_content = json.dumps(user_payload)
 
-        try:
-            resp = requests.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={
-                    "x-api-key": self.api_key,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
-                },
-                json={
-                    "model": self.model,
-                    "max_tokens": 300,
-                    "system": SYSTEM_PROMPT,
-                    "messages": [{"role": "user", "content": json.dumps(user_payload)}],
-                },
-                timeout=self.timeout,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            text = "".join(block.get("text", "") for block in data.get("content", []))
-            parsed = json.loads(text)
+        errors: List[str] = []
+        for provider in self.providers:
+            try:
+                text = call_provider(provider, SYSTEM_PROMPT, user_content, self.timeout)
+                parsed = json.loads(_strip_json_fences(text))
 
-            direction = Direction(parsed.get("direction", "none"))
-            conviction = float(parsed.get("conviction", 0))
-            rationale = str(parsed.get("rationale", ""))[:400]
+                direction = Direction(parsed.get("direction", "none"))
+                conviction = float(parsed.get("conviction", 0))
+                rationale = str(parsed.get("rationale", ""))[:400]
 
-            return AIAssessment(
-                symbol=technical.symbol,
-                direction=direction,
-                conviction=max(0.0, min(100.0, conviction)),
-                rationale=rationale,
-                source="ai",
-            )
-        except Exception as exc:
-            fallback = self._rule_based_fallback(technical, news)
-            fallback.rationale = f"[AI call failed: {exc}] " + fallback.rationale
-            return fallback
+                return AIAssessment(
+                    symbol=technical.symbol,
+                    direction=direction,
+                    conviction=max(0.0, min(100.0, conviction)),
+                    rationale=f"[{provider.name}] {rationale}",
+                    source=f"ai:{provider.name}",
+                )
+            except Exception as exc:
+                errors.append(f"{provider.name}: {exc}")
+                continue  # try the next provider in the priority chain
+
+        fallback = self._rule_based_fallback(technical, news)
+        fallback.rationale = f"[all {len(self.providers)} AI providers failed: {'; '.join(errors)}] " + fallback.rationale
+        return fallback

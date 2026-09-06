@@ -113,7 +113,7 @@ def run():
         market_data=market_data,
         technical_analyzer=TechnicalAnalyzer(),
         news_analyzer=FakeNewsAnalyzer(),
-        ai_agent=AIAgent(api_key="", model="unused"),  # offline/rule-based mode, no network
+        ai_agent=AIAgent(providers=[]),  # offline/rule-based mode, no network
         risk_manager=RiskManager(RiskLimits(
             max_risk_per_trade_pct=1.0, max_leverage=3.0,
             min_liquidation_buffer_mult=2.0, max_portfolio_exposure_pct=70.0,

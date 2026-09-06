@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import argparse
 
-from config import settings
+from config import build_ai_providers, settings
 from core.ai_agent import AIAgent
 from core.bitpin_client import BitpinClient
 from core.market_data import CoinGeckoProvider, MarketDataRouter, TwelveDataProvider
@@ -59,7 +59,7 @@ def build_scanner(logger) -> MarketScanner:
 
     technical_analyzer = TechnicalAnalyzer()
     news_analyzer = NewsAnalyzer(settings.cryptopanic_api_key, settings.news_api_key)
-    ai_agent = AIAgent(settings.anthropic_api_key, settings.anthropic_model)
+    ai_agent = AIAgent(build_ai_providers(settings))
 
     risk_manager = RiskManager(
         RiskLimits(
